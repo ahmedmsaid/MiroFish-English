@@ -1,6 +1,6 @@
 """
-LLM客户端封装
-统一使用OpenAI格式调用
+LLM Client Encapsulation
+Unified call using OpenAI format
 """
 
 import json
@@ -12,7 +12,7 @@ from ..config import Config
 
 
 class LLMClient:
-    """LLM客户端"""
+    """LLM Client"""
     
     def __init__(
         self,
@@ -25,7 +25,7 @@ class LLMClient:
         self.model = model or Config.LLM_MODEL_NAME
         
         if not self.api_key:
-            raise ValueError("LLM_API_KEY 未配置")
+            raise ValueError("LLM_API_KEY not configured")
         
         self.client = OpenAI(
             api_key=self.api_key,
@@ -36,20 +36,20 @@ class LLMClient:
         self,
         messages: List[Dict[str, str]],
         temperature: float = 0.7,
-        max_tokens: int = 4096,
+        max_tokens: int = 16000,
         response_format: Optional[Dict] = None
     ) -> str:
         """
-        发送聊天请求
-        
+        Send chat request
+
         Args:
-            messages: 消息列表
-            temperature: 温度参数
-            max_tokens: 最大token数
-            response_format: 响应格式（如JSON模式）
-            
+            messages: Message list
+            temperature: Temperature parameter
+            max_tokens: Maximum token count (set to 16000 to be compatible with thinking models like GLM-4.7)
+            response_format: Response format (e.g. JSON mode, supported by some cloud models only)
+
         Returns:
-            模型响应文本
+            Model response text
         """
         kwargs = {
             "model": self.model,
@@ -57,13 +57,17 @@ class LLMClient:
             "temperature": temperature,
             "max_tokens": max_tokens,
         }
-        
+
         if response_format:
             kwargs["response_format"] = response_format
-        
+
         response = self.client.chat.completions.create(**kwargs)
         content = response.choices[0].message.content
-        # 部分模型（如MiniMax M2.5）会在content中包含<think>思考内容，需要移除
+
+        # Thinking models (such as GLM-4.7, MiniMax M2.5) may return None content
+        # or include <think>...</think> thinking blocks in content, which need to be removed
+        if not content:
+            content = ""
         content = re.sub(r'<think>[\s\S]*?</think>', '', content).strip()
         return content
     
@@ -71,33 +75,48 @@ class LLMClient:
         self,
         messages: List[Dict[str, str]],
         temperature: float = 0.3,
-        max_tokens: int = 4096
+        max_tokens: int = 16000
     ) -> Dict[str, Any]:
         """
-        发送聊天请求并返回JSON
-        
+        Send chat request and return JSON
+
+        Note: Do not use response_format=json_object because Ollama and some thinking models
+        (such as GLM-4.7) do not support this parameter, which will cause empty responses. 
+        Instead, extract JSON through prompt constraints + regex parsing.
+
         Args:
-            messages: 消息列表
-            temperature: 温度参数
-            max_tokens: 最大token数
-            
+            messages: Message list
+            temperature: Temperature parameter
+            max_tokens: Maximum token count (set to 16000 to be compatible with thinking models)
+
         Returns:
-            解析后的JSON对象
+            Parsed JSON object
         """
         response = self.chat(
             messages=messages,
             temperature=temperature,
             max_tokens=max_tokens,
-            response_format={"type": "json_object"}
+            # Do not pass response_format, rely on prompt constraints + regex extraction
         )
-        # 清理markdown代码块标记
+        # Clean up markdown code block tags (```json ... ``` or ``` ... ```)
         cleaned_response = response.strip()
         cleaned_response = re.sub(r'^```(?:json)?\s*\n?', '', cleaned_response, flags=re.IGNORECASE)
         cleaned_response = re.sub(r'\n?```\s*$', '', cleaned_response)
         cleaned_response = cleaned_response.strip()
 
+        # Try to parse directly
         try:
             return json.loads(cleaned_response)
         except json.JSONDecodeError:
-            raise ValueError(f"LLM返回的JSON格式无效: {cleaned_response}")
+            pass
+
+        # Fallback: extract first JSON object or array from response
+        json_match = re.search(r'(\{[\s\S]+\}|\[[\s\S]+\])', cleaned_response)
+        if json_match:
+            try:
+                return json.loads(json_match.group(1))
+            except json.JSONDecodeError:
+                pass
+
+        raise ValueError(f"Invalid JSON format returned by LLM: {cleaned_response[:500]}")
 

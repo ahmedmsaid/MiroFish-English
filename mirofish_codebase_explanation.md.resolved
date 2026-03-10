@@ -1,0 +1,601 @@
+# MiroFish — Codebase Explanation (Block by Block)
+
+## What is MiroFish?
+
+**MiroFish** is a *Swarm Intelligence Prediction Engine*.  
+You feed it seed documents (news reports, policy drafts, novel chapters…), describe a prediction goal in plain language, and it automatically:
+
+1. Builds a **knowledge graph** of all entities in the documents (using **Zep Cloud**).
+2. Turns each entity into an **AI Agent** with a unique personality and memory.
+3. Runs a dual-platform social-media **simulation** (Twitter + Reddit) powered by the **OASIS** framework.
+4. Has a **Report Agent** analyse the simulation and produce a detailed prediction report.
+5. Lets you **chat** with any simulated agent or with the Report Agent after the simulation.
+
+---
+
+## High-Level Architecture
+
+```mermaid
+flowchart TD
+    Browser["Vue 3 Frontend\n(port 3000)"]
+    Flask["Flask Backend\n(port 5001)"]
+    Zep["Zep Cloud\n(Knowledge Graph)"]
+    LLM["LLM API\n(OpenAI-compatible)"]
+    OASIS["OASIS Simulation\n(Twitter + Reddit)"]
+
+    Browser -->|REST/JSON| Flask
+    Flask -->|Zep SDK| Zep
+    Flask -->|OpenAI SDK| LLM
+    Flask -->|subprocess / IPC| OASIS
+```
+
+---
+
+## Repository Layout
+
+```
+MiroFish/
+├── .env / .env.example        # All secrets & runtime config
+├── package.json               # Root npm scripts (dev, setup, build)
+├── docker-compose.yml         # One-command Docker deploy
+├── Dockerfile                 # Single-container image
+├── backend/                   # Python / Flask
+│   ├── run.py                 # Entrypoint
+│   └── app/
+│       ├── __init__.py        # Flask app factory
+│       ├── config.py          # All Config vars (read from .env)
+│       ├── api/               # HTTP route blueprints
+│       ├── models/            # Data model classes (Project, Task)
+│       ├── services/          # Business logic
+│       └── utils/             # Shared helpers
+└── frontend/                  # Vue 3 + Vite
+    └── src/
+        ├── main.js            # App entry point
+        ├── App.vue            # Root component / layout shell
+        ├── router/index.js    # Client-side routes
+        ├── api/               # Axios wrappers
+        ├── store/             # Pinia global state
+        ├── views/             # Page-level Vue components
+        └── components/        # Reusable UI components
+```
+
+---
+
+## Block 1 — Root [package.json](file:///f:/Courses/AIExperiments/MiroFish/package.json) (Developer Workflow)
+
+**File:** [package.json](file:///f:/Courses/AIExperiments/MiroFish/package.json)
+
+```json
+"scripts": {
+  "setup":         "npm install && cd frontend && npm install",
+  "setup:backend": "cd backend && uv sync",
+  "setup:all":     "npm run setup && npm run setup:backend",
+  "dev":           "concurrently ... \"npm run backend\" \"npm run frontend\"",
+  "backend":       "cd backend && uv run python run.py",
+  "frontend":      "cd frontend && npm run dev"
+}
+```
+
+**Purpose:** A single `npm run dev` at the repo root uses `concurrently` to launch both the Python Flask backend and the Vite dev server simultaneously. `uv` is the fast Python package manager used instead of pip.
+
+---
+
+## Block 2 — [.env](file:///f:/Courses/AIExperiments/MiroFish/.env) / [config.py](file:///f:/Courses/AIExperiments/MiroFish/backend/app/config.py) (Configuration)
+
+**Files:** [.env](file:///f:/Courses/AIExperiments/MiroFish/.env), [backend/app/config.py](file:///f:/Courses/AIExperiments/MiroFish/backend/app/config.py)
+
+The [.env](file:///f:/Courses/AIExperiments/MiroFish/.env) file contains all secrets. [config.py](file:///f:/Courses/AIExperiments/MiroFish/backend/app/config.py) reads them with `python-dotenv` and exposes them as a [Config](file:///f:/Courses/AIExperiments/MiroFish/backend/app/config.py#20-75) class used throughout the backend.
+
+| Config Key | Purpose |
+|---|---|
+| `LLM_API_KEY / BASE_URL / MODEL_NAME` | The LLM to call (any OpenAI-compatible endpoint, e.g., Alibaba Qwen) |
+| `ZEP_API_KEY` | Access to Zep Cloud for the knowledge graph |
+| `UPLOAD_FOLDER` | Where uploaded documents & simulation data are stored |
+| `OASIS_DEFAULT_MAX_ROUNDS` | How many rounds the agent simulation runs |
+| `REPORT_AGENT_MAX_TOOL_CALLS` | How many tool-calls the Report Agent may make per section |
+
+A `Config.validate()` class method checks that the two mandatory keys (`LLM_API_KEY`, `ZEP_API_KEY`) are set, and [run.py](file:///f:/Courses/AIExperiments/MiroFish/backend/run.py) will refuse to start if they are missing.
+
+---
+
+## Block 3 — [backend/run.py](file:///f:/Courses/AIExperiments/MiroFish/backend/run.py) (Backend Entrypoint)
+
+**File:** [backend/run.py](file:///f:/Courses/AIExperiments/MiroFish/backend/run.py)
+
+```python
+def main():
+    errors = Config.validate()   # Fail fast if keys are missing
+    if errors: sys.exit(1)
+    app = create_app()
+    app.run(host='0.0.0.0', port=5001, debug=..., threaded=True)
+```
+
+- Fixes Windows console UTF-8 encoding before importing anything.
+- Adds the `backend/` directory to `sys.path` so `import app` works.
+- Calls [create_app()](file:///f:/Courses/AIExperiments/MiroFish/backend/app/__init__.py#19-80) from the Flask app factory and starts the server. `threaded=True` means each HTTP request runs in its own thread — important because background LLM tasks run in daemon threads.
+
+---
+
+## Block 4 — [backend/app/__init__.py](file:///f:/Courses/AIExperiments/MiroFish/backend/app/__init__.py) (Flask App Factory)
+
+**File:** [backend/app/__init__.py](file:///f:/Courses/AIExperiments/MiroFish/backend/app/__init__.py)
+
+This is the **glue** that wires all pieces together:
+
+```python
+def create_app(config_class=Config):
+    app = Flask(__name__)
+    app.config.from_object(config_class)
+
+    app.json.ensure_ascii = False   # Chinese chars render as-is
+
+    CORS(app, resources={r"/api/*": {"origins": "*"}})  # Allow frontend
+
+    SimulationRunner.register_cleanup()  # Kill child processes on exit
+
+    # Middleware: log every request/response
+    @app.before_request / @app.after_request ...
+
+    # Register route blueprints
+    app.register_blueprint(graph_bp,      url_prefix='/api/graph')
+    app.register_blueprint(simulation_bp, url_prefix='/api/simulation')
+    app.register_blueprint(report_bp,     url_prefix='/api/report')
+
+    @app.route('/health')  # Simple liveness check
+    return {'status': 'ok'}
+```
+
+**Key decisions:**
+- **CORS** wildcard on `/api/*` lets the Vite dev server on port 3000 call the Flask server on port 5001 without browser errors.
+- **`SimulationRunner.register_cleanup()`** — registers an `atexit` hook that terminates any running OASIS child processes when Flask shuts down.
+
+---
+
+## Block 5 — [utils/logger.py](file:///f:/Courses/AIExperiments/MiroFish/backend/app/utils/logger.py) (Logging)
+
+**File:** [backend/app/utils/logger.py](file:///f:/Courses/AIExperiments/MiroFish/backend/app/utils/logger.py)
+
+Configures **dual-output logging**:
+- **File handler** — `backend/logs/YYYY-MM-DD.log`, rotating at 10 MB, keeps 5 backups. Full `DEBUG`-level detail with function name and line number.
+- **Console handler** — `INFO` and above, concise format.
+
+Both handlers handle Windows UTF-8 encoding issues. The [get_logger(name)](file:///f:/Courses/AIExperiments/MiroFish/backend/app/utils/logger.py#91-105) helper follows Python's hierarchical logger convention (e.g., `mirofish.api.simulation`), so you can control sub-module verbosity independently.
+
+---
+
+## Block 6 — [utils/llm_client.py](file:///f:/Courses/AIExperiments/MiroFish/backend/app/utils/llm_client.py) (LLM Wrapper)
+
+**File:** [backend/app/utils/llm_client.py](file:///f:/Courses/AIExperiments/MiroFish/backend/app/utils/llm_client.py)
+
+A thin wrapper around the **OpenAI Python SDK** that:
+- Reads the configured model/key/base URL from [Config](file:///f:/Courses/AIExperiments/MiroFish/backend/app/config.py#20-75).
+- Provides [chat(messages, temperature, max_tokens)](file:///f:/Courses/AIExperiments/MiroFish/backend/app/utils/llm_client.py#35-69) → returns the raw text response, stripping `<think>…</think>` blocks that some models (e.g., MiniMax) include.
+- Provides [chat_json(messages)](file:///f:/Courses/AIExperiments/MiroFish/backend/app/utils/llm_client.py#70-103) → calls the model with `response_format={"type":"json_object"}` and then `json.loads()` the cleaned response (strips Markdown code fences).
+
+Because `base_url` is configurable, the same code works with OpenAI, Alibaba Bailian (Qwen), or any other OpenAI-compatible endpoint.
+
+---
+
+## Block 7 — [utils/file_parser.py](file:///f:/Courses/AIExperiments/MiroFish/backend/app/utils/file_parser.py) (Document Ingestion)
+
+**File:** [backend/app/utils/file_parser.py](file:///f:/Courses/AIExperiments/MiroFish/backend/app/utils/file_parser.py)
+
+**[FileParser](file:///f:/Courses/AIExperiments/MiroFish/backend/app/utils/file_parser.py#61-145)** handles three document formats:
+- **PDF** — uses `PyMuPDF (fitz)` to extract text page by page.
+- **Markdown / TXT** — calls [_read_text_with_fallback()](file:///f:/Courses/AIExperiments/MiroFish/backend/app/utils/file_parser.py#11-59) which tries UTF-8, then `charset_normalizer`, then `chardet`, then UTF-8 with `errors='replace'` — robust multi-language file handling.
+
+**[split_text_into_chunks(text, chunk_size=500, overlap=50)](file:///f:/Courses/AIExperiments/MiroFish/backend/app/utils/file_parser.py#147-189)** — splits extracted text into overlapping chunks for ingestion into the knowledge graph. It tries to break at natural sentence boundaries (`。！？ .! ?`) rather than mid-word.
+
+---
+
+## Block 8 — [utils/retry.py](file:///f:/Courses/AIExperiments/MiroFish/backend/app/utils/retry.py) (Retry Mechanisms)
+
+**File:** [backend/app/utils/retry.py](file:///f:/Courses/AIExperiments/MiroFish/backend/app/utils/retry.py)
+
+Provides three retry tools:
+
+1. **`@retry_with_backoff(max_retries=3)`** — a decorator. Exponential back-off with optional jitter. Catches specified exception types and re-raises after `max_retries`.
+2. **`@retry_with_backoff_async`** — async version for `await`able functions.
+3. **[RetryableAPIClient](file:///f:/Courses/AIExperiments/MiroFish/backend/app/utils/retry.py#132-238)** — OOP version with [call_with_retry()](file:///f:/Courses/AIExperiments/MiroFish/backend/app/utils/retry.py#149-194) and [call_batch_with_retry()](file:///f:/Courses/AIExperiments/MiroFish/backend/app/utils/retry.py#195-238) for processing a list where each item might fail independently.
+
+All three log warnings on each retry and a final error on exhaustion.
+
+---
+
+## Block 9 — [models/project.py](file:///f:/Courses/AIExperiments/MiroFish/backend/app/models/project.py) (Project Persistence)
+
+**File:** [backend/app/models/project.py](file:///f:/Courses/AIExperiments/MiroFish/backend/app/models/project.py)
+
+### [ProjectStatus](file:///f:/Courses/AIExperiments/MiroFish/backend/app/models/project.py#17-24) (enum)
+```
+created → ontology_generated → graph_building → graph_completed → failed
+```
+
+### [Project](file:///f:/Courses/AIExperiments/MiroFish/backend/app/models/project.py#26-99) (dataclass)
+Holds all project state: uploaded files, extracted text length, the generated ontology, the Zep graph ID, the simulation requirement text, and any error.
+
+### [ProjectManager](file:///f:/Courses/AIExperiments/MiroFish/backend/app/models/project.py#101-305) (class)
+Manages the **filesystem** store under `backend/uploads/projects/<project_id>/`:
+- `project.json` — serialised [Project](file:///f:/Courses/AIExperiments/MiroFish/backend/app/models/project.py#26-99) dict.
+- [files/](file:///f:/Courses/AIExperiments/MiroFish/backend/app/services/simulation_manager.py#480-494) — sanitised copies of the user-uploaded documents.
+- `extracted_text.txt` — all document text concatenated.
+
+Key methods: [create_project()](file:///f:/Courses/AIExperiments/MiroFish/backend/app/models/project.py#132-166), [save_project()](file:///f:/Courses/AIExperiments/MiroFish/backend/app/models/project.py#167-175), [get_project()](file:///f:/Courses/AIExperiments/MiroFish/backend/app/models/project.py#176-196), [list_projects()](file:///f:/Courses/AIExperiments/MiroFish/backend/app/models/project.py#197-220), [delete_project()](file:///f:/Courses/AIExperiments/MiroFish/backend/app/api/graph.py#69-86).  
+Files are saved with a random hex prefix (`uuid4().hex[:8]`) to prevent path traversal attacks.
+
+---
+
+## Block 10 — [models/task.py](file:///f:/Courses/AIExperiments/MiroFish/backend/app/models/task.py) (Async Task Tracking)
+
+**File:** [backend/app/models/task.py](file:///f:/Courses/AIExperiments/MiroFish/backend/app/models/task.py)
+
+Long-running operations (graph build, simulation prepare, report generate) are spawned as **daemon threads**. [TaskManager](file:///f:/Courses/AIExperiments/MiroFish/backend/app/models/task.py#54-184) tracks their progress in memory.
+
+### [TaskStatus](file:///f:/Courses/AIExperiments/MiroFish/backend/app/models/task.py#14-20) (enum)
+`pending → processing → completed | failed`
+
+### [Task](file:///f:/Courses/AIExperiments/MiroFish/backend/app/models/task.py#22-52) (dataclass)
+`task_id`, `task_type`, [status](file:///f:/Courses/AIExperiments/MiroFish/backend/app/api/simulation.py#1700-1756), [progress](file:///f:/Courses/AIExperiments/MiroFish/backend/app/services/simulation_manager.py#317-327) (0–100), `message`, `result`, [error](file:///f:/Courses/AIExperiments/MiroFish/backend/app/utils/logger.py#121-123), `progress_detail` (structured sub-stage info).
+
+### [TaskManager](file:///f:/Courses/AIExperiments/MiroFish/backend/app/models/task.py#54-184) (singleton)
+Thread-safe (uses `threading.Lock`). The HTTP API polls `/api/graph/task/{task_id}` to show live progress bars in the UI.
+
+```python
+task_id = task_manager.create_task("build_graph")
+# ... in background thread:
+task_manager.update_task(task_id, progress=42, message="Adding chunk 21/50")
+task_manager.complete_task(task_id, result={...})
+```
+
+---
+
+## Block 11 — [api/graph.py](file:///f:/Courses/AIExperiments/MiroFish/backend/app/api/graph.py) (Graph API Routes)
+
+**File:** [backend/app/api/graph.py](file:///f:/Courses/AIExperiments/MiroFish/backend/app/api/graph.py)
+
+Registered at `/api/graph`. Contains two main pipelines:
+
+### Pipeline A — Ontology Generation (`POST /ontology/generate`)
+1. Accept `multipart/form-data` with uploaded files + `simulation_requirement`.
+2. Create a [Project](file:///f:/Courses/AIExperiments/MiroFish/backend/app/models/project.py#26-99) via [ProjectManager](file:///f:/Courses/AIExperiments/MiroFish/backend/app/models/project.py#101-305).
+3. Parse each file with [FileParser](file:///f:/Courses/AIExperiments/MiroFish/backend/app/utils/file_parser.py#61-145), preprocess with `TextProcessor`.
+4. Call `OntologyGenerator.generate()` (LLM call) → returns entity types + edge types.
+5. Save ontology to project; set status = `ontology_generated`.
+6. Return `project_id` + ontology to frontend.
+
+### Pipeline B — Graph Build (`POST /build`)
+1. Validate `project_id`, check ontology exists.
+2. Create a [Task](file:///f:/Courses/AIExperiments/MiroFish/backend/app/models/task.py#22-52), set status = `graph_building`.
+3. Spawn a **daemon thread** that:
+   - Creates a Zep graph via `GraphBuilderService.create_graph()`.
+   - Sets the ontology via `GraphBuilderService.set_ontology()`.
+   - Pushes text in batches via [add_text_batches()](file:///f:/Courses/AIExperiments/MiroFish/backend/app/services/graph_builder.py#288-340).
+   - Waits for all episodes to be **processed** by Zep ([_wait_for_episodes()](file:///f:/Courses/AIExperiments/MiroFish/backend/app/services/graph_builder.py#341-396)).
+   - Sets project status = `graph_completed`.
+4. Immediately return `task_id` to the frontend (202-style async response).
+
+Other routes: project CRUD (`GET/DELETE /project/<id>`, `POST /project/<id>/reset`), task polling (`GET /task/<id>`), graph data retrieval and deletion.
+
+---
+
+## Block 12 — [services/graph_builder.py](file:///f:/Courses/AIExperiments/MiroFish/backend/app/services/graph_builder.py) (Zep Knowledge Graph)
+
+**File:** [backend/app/services/graph_builder.py](file:///f:/Courses/AIExperiments/MiroFish/backend/app/services/graph_builder.py)
+
+Wraps the **Zep Cloud Python SDK**:
+
+- **[create_graph(name)](file:///f:/Courses/AIExperiments/MiroFish/backend/app/services/graph_builder.py#187-198)** — creates a named standalone graph in Zep, returns a `mirofish_<hex>` graph ID.
+- **[set_ontology(graph_id, ontology)](file:///f:/Courses/AIExperiments/MiroFish/backend/app/services/graph_builder.py#199-287)** — dynamically creates Pydantic classes from the LLM-generated ontology dict, then calls `client.graph.set_ontology()`. Reserved Zep attribute names (like `uuid`, [name](file:///f:/Courses/AIExperiments/MiroFish/backend/app/services/graph_builder.py#213-218)) are automatically renamed with an [entity_](file:///f:/Courses/AIExperiments/MiroFish/backend/app/api/simulation.py#92-123) prefix.
+- **[add_text_batches(graph_id, chunks, batch_size=3)](file:///f:/Courses/AIExperiments/MiroFish/backend/app/services/graph_builder.py#288-340)** — sends chunks as `EpisodeData(type="text")` objects in batches of 3, sleeps 1 second between batches to respect rate limits. Returns the UUID of every submitted episode.
+- **[_wait_for_episodes(episode_uuids)](file:///f:/Courses/AIExperiments/MiroFish/backend/app/services/graph_builder.py#341-396)** — polls each episode's `processed` flag every 3 seconds for up to 10 minutes. Zep processes episodes asynchronously (entity extraction, relation detection) and this ensures we don't query the graph before it's ready.
+- **[get_graph_data(graph_id)](file:///f:/Courses/AIExperiments/MiroFish/backend/app/api/graph.py#564-590)** — retrieves all nodes and edges using `fetch_all_nodes` / `fetch_all_edges` from [utils/zep_paging.py](file:///f:/Courses/AIExperiments/MiroFish/backend/app/utils/zep_paging.py) (which handles Zep's cursor-based pagination).
+
+---
+
+## Block 13 — [services/ontology_generator.py](file:///f:/Courses/AIExperiments/MiroFish/backend/app/services/ontology_generator.py) (LLM Ontology Design)
+
+**File:** [backend/app/services/ontology_generator.py](file:///f:/Courses/AIExperiments/MiroFish/backend/app/services/ontology_generator.py)
+
+Calls the LLM to analyse the uploaded documents and design a **domain-specific ontology**:
+
+```json
+{
+  "entity_types": [
+    { "name": "Student", "description": "...", "attributes": [...] },
+    { "name": "University", ... }
+  ],
+  "edge_types": [
+    { "name": "ATTENDS", "source_targets": [{"source":"Student","target":"University"}], ... }
+  ],
+  "analysis_summary": "This documents concerns..."
+}
+```
+
+The LLM is prompted with the full document text plus the `simulation_requirement` to produce entity/edge types that are semantically rich and tailored to the simulation scenario.
+
+---
+
+## Block 14 — [services/zep_entity_reader.py](file:///f:/Courses/AIExperiments/MiroFish/backend/app/services/zep_entity_reader.py) (Graph Entity Extraction)
+
+**File:** [backend/app/services/zep_entity_reader.py](file:///f:/Courses/AIExperiments/MiroFish/backend/app/services/zep_entity_reader.py)
+
+After the graph is built, this service reads it back and **filters** nodes to keep only those whose type labels match the ontology entity types — excluding raw Zep internals like `Entity`, `Node`, `Episodic`.
+
+Returns a `FilteredEntities` object:
+```python
+@dataclass
+class FilteredEntities:
+    entities: List[EntityInfo]       # Full entity objects
+    entity_types: Set[str]           # Types that were found
+    filtered_count: int
+    total_count: int
+```
+
+Each `EntityInfo` contains the entity's UUID, name, Zep node labels, summary, and optionally a list of related edges (its relationships in the graph). This rich context is used to generate realistic agent personas.
+
+---
+
+## Block 15 — [services/oasis_profile_generator.py](file:///f:/Courses/AIExperiments/MiroFish/backend/app/services/oasis_profile_generator.py) (Agent Persona Generation)
+
+**File:** [backend/app/services/oasis_profile_generator.py](file:///f:/Courses/AIExperiments/MiroFish/backend/app/services/oasis_profile_generator.py)
+
+For each graph entity, this service generates an **`OasisAgentProfile`** — a social-media persona compatible with the OASIS simulation framework.
+
+Each profile includes:
+- `username`, `bio`, [name](file:///f:/Courses/AIExperiments/MiroFish/backend/app/services/graph_builder.py#213-218)
+- `mbti` personality type, `activity_level` (low/medium/high)
+- `following_aggressiveness` (how eagerly the agent follows others)
+- `memory_content` (the agent's "background knowledge" seeded from its graph context)
+- Platform-specific content ready for Twitter CSV or Reddit JSON formats
+
+LLM generation is **parallelised**: a `ThreadPoolExecutor` runs up to `parallel_count` (default 5) profile generations concurrently. Results are **saved incrementally** so the frontend can show progress even before all agents are ready.
+
+---
+
+## Block 16 — [services/simulation_config_generator.py](file:///f:/Courses/AIExperiments/MiroFish/backend/app/services/simulation_config_generator.py) (Simulation Parameter Design)
+
+**File:** [backend/app/services/simulation_config_generator.py](file:///f:/Courses/AIExperiments/MiroFish/backend/app/services/simulation_config_generator.py)
+
+The LLM is asked to intelligently pick simulation parameters based on the scenario:
+
+```python
+@dataclass
+class SimulationParameters:
+    max_rounds: int             # How many simulation rounds to run
+    round_time_step: int        # Simulated minutes per round
+    start_time: str             # Simulated start time (e.g., "2025-04-01 08:00")
+    active_ratio: float         # Fraction of agents active per round (0.0–1.0)
+    model_platform_twitter: str # LLM model for Twitter agents
+    model_platform_reddit: str  # LLM model for Reddit agents
+    generation_reasoning: str   # Why these parameters were chosen
+```
+
+The output is saved as `simulation_config.json` in the simulation directory and is read by the OASIS runner scripts.
+
+---
+
+## Block 17 — [services/simulation_manager.py](file:///f:/Courses/AIExperiments/MiroFish/backend/app/services/simulation_manager.py) (Simulation Lifecycle)
+
+**File:** [backend/app/services/simulation_manager.py](file:///f:/Courses/AIExperiments/MiroFish/backend/app/services/simulation_manager.py)
+
+Orchestrates the full **prepare** pipeline:
+
+```
+create_simulation()
+    → prepare_simulation()
+        Phase 1: ZepEntityReader.filter_defined_entities()
+        Phase 2: OasisProfileGenerator.generate_profiles_from_entities() [parallel]
+                 → save reddit_profiles.json + twitter_profiles.csv
+        Phase 3: SimulationConfigGenerator.generate_config()
+                 → save simulation_config.json
+        → set status = READY
+```
+
+Each simulation has a directory at `backend/uploads/simulations/<sim_id>/` with:
+- `state.json` — simulation lifecycle status
+- `reddit_profiles.json` — agent personas for Reddit
+- `twitter_profiles.csv` — agent personas for Twitter
+- `simulation_config.json` — all OASIS run parameters
+
+[SimulationStatus](file:///f:/Courses/AIExperiments/MiroFish/backend/app/services/simulation_manager.py#24-34) enum: `created → preparing → ready → running → stopped/completed/failed`
+
+---
+
+## Block 18 — [services/simulation_runner.py](file:///f:/Courses/AIExperiments/MiroFish/backend/app/services/simulation_runner.py) & [simulation_ipc.py](file:///f:/Courses/AIExperiments/MiroFish/backend/app/services/simulation_ipc.py) (Running OASIS)
+
+**Files:** [simulation_runner.py](file:///f:/Courses/AIExperiments/MiroFish/backend/app/services/simulation_runner.py), [simulation_ipc.py](file:///f:/Courses/AIExperiments/MiroFish/backend/app/services/simulation_ipc.py)
+
+`SimulationRunner` spawns the OASIS simulation scripts (`backend/scripts/run_*.py`) as **child processes** using Python's `subprocess` module. OASIS itself is a heavy async simulation framework that must run in its own process.
+
+[simulation_ipc.py](file:///f:/Courses/AIExperiments/MiroFish/backend/app/services/simulation_ipc.py) handles **Inter-Process Communication** — reading real-time log lines from the child processes and updating the simulation state (`current_round`, `twitter_status`, `reddit_status`) visible to the frontend.
+
+`SimulationRunner.register_cleanup()` installs an `atexit` handler that `SIGTERM`s any surviving child processes when Flask shuts down.
+
+---
+
+## Block 19 — [services/report_agent.py](file:///f:/Courses/AIExperiments/MiroFish/backend/app/services/report_agent.py) (AI Report Generation)
+
+**File:** [backend/app/services/report_agent.py](file:///f:/Courses/AIExperiments/MiroFish/backend/app/services/report_agent.py) (101 KB — the largest service)
+
+`ReportAgent` is a **tool-using LLM agent** that:
+
+1. **Plans** the report structure (outline with section titles and aims).
+2. **Writes each section** by calling tools to gather evidence:
+   - `insight_forge` — searches the Zep graph for relevant facts
+   - `memory_recall` — retrieves specific agent memories from Zep
+   - `post_analyzer` — analyses simulation social-media posts
+   - `trend_detector` — identifies behavioural patterns over time
+3. **Reflects & refines** each section for up to `REPORT_AGENT_MAX_REFLECTION_ROUNDS` passes.
+4. **Saves sections incrementally** — the frontend can poll for completed sections while the rest is still generating.
+
+`ReportManager` handles report persistence at `backend/uploads/reports/<report_id>/`:
+- `report.json` — metadata and final Markdown
+- `section_01.md`, `section_02.md`, … — individual sections
+- `agent_log.jsonl` — JSONL log of every LLM call and tool invocation (for the frontend's live "Agent Log" panel)
+- `progress.json` — current section name, progress %, timestamps
+
+`ReportAgent.chat()` provides the **interactive Q&A** feature — same tool set, but in a conversation-history-aware mode.
+
+---
+
+## Block 20 — [api/simulation.py](file:///f:/Courses/AIExperiments/MiroFish/backend/app/api/simulation.py) (Simulation API Routes)
+
+**File:** [backend/app/api/simulation.py](file:///f:/Courses/AIExperiments/MiroFish/backend/app/api/simulation.py)
+
+Registered at `/api/simulation`. Key endpoints:
+
+| Endpoint | Method | Description |
+|---|---|---|
+| `/entities/<graph_id>` | GET | Retrieve & filter graph entities |
+| `/create` | POST | Create a simulation record |
+| `/prepare` | POST | Kick off async agent/config generation |
+| `/prepare/status` | POST | Poll preparation progress |
+| `/<sim_id>` | GET | Get simulation status |
+| `/start` | POST | Start the OASIS child processes |
+| `/stop` | POST | Stop the running simulation |
+| `/interview` | POST | Ask a specific simulated agent a question |
+| `/posts/<sim_id>` | GET | Stream simulated social-media posts |
+
+Smart idempotency: `/prepare` checks if all necessary files already exist (via [_check_simulation_prepared()](file:///f:/Courses/AIExperiments/MiroFish/backend/app/api/simulation.py#239-356)) and returns immediately if the simulation is already ready — avoid re-generating.
+
+**Interview feature:** Before sending the question to the agent, a prefix is prepended (`"结合你的人设...不调用工具直接用文本回复:"`) to suppress tool-calling and get a plain-text answer.
+
+---
+
+## Block 21 — [api/report.py](file:///f:/Courses/AIExperiments/MiroFish/backend/app/api/report.py) (Report API Routes)
+
+**File:** [backend/app/api/report.py](file:///f:/Courses/AIExperiments/MiroFish/backend/app/api/report.py)
+
+Registered at `/api/report`. Key endpoints:
+
+| Endpoint | Method | Description |
+|---|---|---|
+| `/generate` | POST | Start async report generation |
+| `/generate/status` | POST | Poll generation progress |
+| `/<report_id>` | GET | Fetch full report metadata + Markdown |
+| `/<report_id>/sections` | GET | Fetch only completed sections (streaming UX) |
+| `/<report_id>/section/<n>` | GET | Fetch one specific section |
+| `/<report_id>/progress` | GET | Real-time generation progress |
+| `/<report_id>/agent-log` | GET | Incremental agent log (from_line param) |
+| `/by-simulation/<sim_id>` | GET | Look up report by simulation ID |
+| `/check/<sim_id>` | GET | Is interview feature unlocked? |
+| `/chat` | POST | Multi-turn Q&A with Report Agent |
+| `/<report_id>/download` | GET | Download full Markdown file |
+
+The `from_line` parameter on `/agent-log` enables **incremental polling** — the frontend requests only new log lines since the last fetch, avoiding resending the full log.
+
+---
+
+## Block 22 — Frontend: [main.js](file:///f:/Courses/AIExperiments/MiroFish/frontend/src/main.js) & [router/index.js](file:///f:/Courses/AIExperiments/MiroFish/frontend/src/router/index.js)
+
+**Files:** [frontend/src/main.js](file:///f:/Courses/AIExperiments/MiroFish/frontend/src/main.js), [frontend/src/router/index.js](file:///f:/Courses/AIExperiments/MiroFish/frontend/src/router/index.js)
+
+**[main.js](file:///f:/Courses/AIExperiments/MiroFish/frontend/src/main.js)** — standard Vue 3 entry point: creates the app, attaches the router, mounts to `#app`.
+
+**Router** defines six page routes:
+
+```
+/                            → Home.vue           (upload files, start project)
+/process/:projectId          → MainView.vue        (build graph, configure)
+/simulation/:simulationId    → SimulationView.vue  (prepare agents, view config)
+/simulation/:simulationId/start → SimulationRunView.vue (run + live feed)
+/report/:reportId            → ReportView.vue      (read generated report)
+/interaction/:reportId       → InteractionView.vue (chat with agents / Report Agent)
+```
+
+All IDs are passed as route props directly to the component — no extra Vuex/Pinia lookup needed.
+
+---
+
+## Block 23 — Frontend: [api/index.js](file:///f:/Courses/AIExperiments/MiroFish/frontend/src/api/index.js) (HTTP Client)
+
+**File:** [frontend/src/api/index.js](file:///f:/Courses/AIExperiments/MiroFish/frontend/src/api/index.js)
+
+Creates an **Axios** instance:
+- `baseURL` from `VITE_API_BASE_URL` (defaults to `http://localhost:5001`).
+- 5-minute timeout — some LLM operations are slow.
+- **Response interceptor** — if the response has `success: false`, it converts the payload into a rejected `Promise`, so every API call can use `.catch()` uniformly.
+- **[requestWithRetry(fn, maxRetries=3)](file:///f:/Courses/AIExperiments/MiroFish/frontend/src/api/index.js#53-66)** — exported utility that wraps any API function with exponential back-off retries (doubles the delay on each retry).
+
+---
+
+## Block 24 — Frontend: Views (Page Components)
+
+| File | Role |
+|---|---|
+| [Home.vue](file:///f:/Courses/AIExperiments/MiroFish/frontend/src/views/Home.vue) | Landing page. File drag-and-drop, project name, simulation goal textarea. Calls `POST /api/graph/ontology/generate`. On success, navigates to `/process/:projectId`. |
+| [MainView.vue](file:///f:/Courses/AIExperiments/MiroFish/frontend/src/views/MainView.vue) | Shows the generated ontology (entity types, relation types, a summary). Lets the user trigger graph build (`POST /api/graph/build`). Polls the task status until graph is complete, then navigates to simulation. |
+| [SimulationView.vue](file:///f:/Courses/AIExperiments/MiroFish/frontend/src/views/SimulationView.vue) | Shows simulation metadata (entity count, entity types, profiles). Triggers `POST /api/simulation/prepare` and polls progress via animated stage steps. |
+| [SimulationRunView.vue](file:///f:/Courses/AIExperiments/MiroFish/frontend/src/views/SimulationRunView.vue) | Runs the simulation (`POST /api/simulation/start`). Shows live post feed and round counter with animated Twitter/Reddit counters. Provides a Stop button. |
+| [ReportView.vue](file:///f:/Courses/AIExperiments/MiroFish/frontend/src/views/ReportView.vue) | Polls for completed report sections incrementally. Renders Markdown with a library. Shows agent-log panel in real time. |
+| [InteractionView.vue](file:///f:/Courses/AIExperiments/MiroFish/frontend/src/views/InteractionView.vue) | Chat interface. Lets the user choose "Chat with Report Agent" or "Interview Agent <name>". Maintains a conversation history array passed with every message. |
+| [Process.vue](file:///f:/Courses/AIExperiments/MiroFish/frontend/src/views/Process.vue) | (Appears to be a combined super-view for the whole process pipeline, possibly used for different layout contexts.) |
+
+---
+
+## Block 25 — Backend Scripts (`backend/scripts/`)
+
+These are standalone Python scripts launched by `SimulationRunner` as child processes:
+
+- `run_twitter_simulation.py` — runs OASIS Twitter simulation, reads `simulation_config.json`, writes post data back via IPC.
+- `run_reddit_simulation.py` — same for Reddit.
+- `run_parallel_simulation.py` — starts both Twitter and Reddit in parallel threads.
+
+Scripts stay in `backend/scripts/` and are **not** copied to the simulation data directory, so the same scripts are reused across all simulations.
+
+---
+
+## Block 26 — `docker-compose.yml` & `Dockerfile`
+
+**`docker-compose.yml`** — single service, single container image `ghcr.io/666ghj/mirofish:latest`.  
+- Exposes ports `3000` (frontend served by Nginx or Node) and `5001` (Flask).
+- Mounts `./backend/uploads` into the container so simulation data, reports, and uploaded files persist across container restarts.
+- Reads `./env` automatically.
+
+The Dockerfile builds both the frontend (Vite build) and installs the Python dependencies, then packages everything into one container.
+
+---
+
+## Full Data Flow Summary
+
+```
+User uploads documents + describes goal
+    ↓  POST /api/graph/ontology/generate
+    ↓  LLM analyses documents → ontology (entity + edge types)
+    ↓  project_id returned to frontend
+
+User confirms ontology
+    ↓  POST /api/graph/build
+    ↓  Background thread:
+           Zep graph created
+           Document chunks added as Episodes
+           Wait for Zep to process (entity extraction)
+    ↓  task_id polled until graph_completed
+
+User starts simulation
+    ↓  POST /api/simulation/create
+    ↓  POST /api/simulation/prepare (async)
+           Read Zep entities → filter to ontology types
+           LLM generates each entity's social-media persona (parallel)
+           LLM picks simulation parameters (rounds, timing, etc.)
+    ↓  status = READY
+
+User runs simulation
+    ↓  POST /api/simulation/start
+    ↓  OASIS child processes:
+           Twitter agents interact: post, like, repost, follow
+           Reddit agents interact: post, comment, upvote, search
+    ↓  Real-time post feed streamed to frontend
+
+User generates report
+    ↓  POST /api/report/generate
+    ↓  ReportAgent:
+           Plans outline (LLM)
+           For each section: calls Zep search + post analysis tools,
+                             writes section (LLM), saves section file
+    ↓  Full Markdown report assembled
+
+User chats
+    ↓  POST /api/report/chat           → Q&A with Report Agent
+    ↓  POST /api/simulation/interview  → Q&A with any simulated character
+```
