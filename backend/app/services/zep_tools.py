@@ -1025,45 +1025,77 @@ class ZepToolsService:
         
         # Step 3: Extract relevant entity UUIDs from edges, only fetch info for these entities (not all nodes)
         entity_uuids = set()
-        for edge_data in all_edges:
-            if isinstance(edge_data, dict):
-                source_uuid = edge_data.get('source_node_uuid', '')
-                target_uuid = edge_data.get('target_node_uuid', '')
-                if source_uuid:
-                    entity_uuids.add(source_uuid)
-                if target_uuid:
-                    entity_uuids.add(target_uuid)
+        seen_edge_uuids = set()
+        unique_edges = []
         
-        # Fetch details for all relevant entities (not limited, full output)
+        for edge_data in all_edges:
+            if not isinstance(edge_data, dict):
+                continue
+            
+            edge_uuid = edge_data.get('uuid', '')
+            if edge_uuid and edge_uuid in seen_edge_uuids:
+                continue
+            
+            if edge_uuid:
+                seen_edge_uuids.add(edge_uuid)
+            
+            unique_edges.append(edge_data)
+            
+            source_uuid = edge_data.get('source_node_uuid', '')
+            target_uuid = edge_data.get('target_node_uuid', '')
+            if source_uuid:
+                entity_uuids.add(source_uuid)
+            if target_uuid:
+                entity_uuids.add(target_uuid)
+        
+        # Use the deduplicated edges for further processing
+        all_edges = unique_edges
+        
+        # Step 4: Fetch detailed node information (Optimized: fetch all and filter)
         entity_insights = []
         node_map = {}  # For subsequent relationship chain construction
         
-        for uuid in list(entity_uuids):  # Process all entities, no truncation
-            if not uuid:
-                continue
-            try:
-                # Fetch info for each related node individually
-                node = self.get_node_detail(uuid)
-                if node:
-                    node_map[uuid] = node
-                    entity_type = next((l for l in node.labels if l not in ["Entity", "Node"]), "Entity")
+        if entity_uuids:
+            logger.info(f"Insight Forge [Step 3]: Fetching all nodes to resolve {len(entity_uuids)} unique UUIDs...")
+            # Fetch all nodes once (usually faster than individual calls for small/medium graphs)
+            all_graph_nodes = self.get_all_nodes(graph_id)
+            
+            # Map nodes for quick lookup
+            graph_node_map = {n.uuid: n for n in all_graph_nodes}
+            
+            for uuid in list(entity_uuids):
+                if not uuid:
+                    continue
+                try:
+                    node = graph_node_map.get(uuid)
                     
-                    # Fetch all related facts for this entity (no truncation)
-                    related_facts = [
-                        f for f in all_facts 
-                        if node.name.lower() in f.lower()
-                    ]
+                    # Fallback: if node not in all_graph_nodes (maybe it was just added?), fetch individually
+                    if not node:
+                        try:
+                            node = self.get_node_detail(uuid)
+                        except Exception:
+                            continue
                     
-                    entity_insights.append({
-                        "uuid": node.uuid,
-                        "name": node.name,
-                        "type": entity_type,
-                        "summary": node.summary,
-                        "related_facts": related_facts  # Full output, no truncation
-                    })
-            except Exception as e:
-                logger.debug(f"Failed to fetch node {uuid}: {e}")
-                continue
+                    if node:
+                        node_map[uuid] = node
+                        entity_type = next((l for l in node.labels if l not in ["Entity", "Node"]), "Entity")
+                        
+                        # Fetch all related facts for this entity
+                        related_facts = [
+                            f for f in all_facts 
+                            if node.name.lower() in f.lower()
+                        ]
+                        
+                        entity_insights.append({
+                            "uuid": node.uuid,
+                            "name": node.name,
+                            "type": entity_type,
+                            "summary": node.summary,
+                            "related_facts": related_facts
+                        })
+                except Exception as e:
+                    logger.debug(f"Failed to fetch node {uuid}: {e}")
+                    continue
         
         result.entity_insights = entity_insights
         result.total_entities = len(entity_insights)

@@ -821,10 +821,10 @@ def _enrich_action_context(
         elif action_type == 'FOLLOW':
             follow_id = action_args.get('follow_id')
             if follow_id:
-                    # Get followee_id from follow table
-                    cursor.execute("""
-                        SELECT followee_id FROM follow WHERE follow_id = ?
-                    """, (follow_id,))
+                # Get followee_id from follow table
+                cursor.execute("""
+                    SELECT followee_id FROM follow WHERE follow_id = ?
+                """, (follow_id,))
                 row = cursor.fetchone()
                 if row:
                     followee_id = row[0]
@@ -991,7 +991,7 @@ def _get_comment_info(
     return None
 
 
-def create_model(config: Dict[str, Any], use_boost: bool = False):
+def create_model(config: Dict[str, Any], use_boost: bool = True):
     """
     Create LLM model
     
